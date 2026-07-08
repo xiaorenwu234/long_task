@@ -6,11 +6,12 @@
 
 AgentScope 原生只提供 `sequential_pipeline` / `fanout_pipeline` / `MsgHub` 等线性编排；
 本项目补齐了 LangGraph 式的**图编排**能力（节点、边、条件边、状态、循环），
-并把这些能力封装成可供前端拖拽可视化的 API。
+并在此基础上构建了**可插拔扩展体系**（记忆、动态路由、流控、恢复策略、资源调度）
+和**钩子机制**，同时把这些能力封装成可供前端拖拽可视化的 API。
 
 ---
 
-## ✨ 功能特性
+## 功能特性
 
 ### 1. LangGraph 式图编排（`StateGraph` / `CompiledGraph`）
 - **节点（Node）**：可包裹普通函数（同步/异步）、AgentScope agent、或子图。
@@ -21,37 +22,61 @@ AgentScope 原生只提供 `sequential_pipeline` / `fanout_pipeline` / `MsgHub` 
 - **Pregel 风格超步执行**：天然支持顺序、分支、并行、循环，并带**递归步数上限**防止死循环。
 - **流式执行** `astream()`：逐节点产出 `node_start`/`node_end`/`final` 事件，便于前端实时展示。
 
-### 2. 面向前端的编排接口（`Orchestrator`）
+### 2. 可插拔扩展体系（`engine.modules` + `engine.hooks`）
+
+五大扩展模块均提供 **ABC 接口 + NoOp 空实现桩**，未接入时零开销，按需插拔替换：
+
+| 模块 | 文件 | 能力 |
+|------|------|------|
+| **记忆** | `modules/memory.py` | 四级层级记忆（WORKING → TASK → PROJECT → GLOBAL），级联检索 |
+| **动态路由** | `modules/routing.py` | 静态 Router + 运行时 RoutingPolicy，运行时动态决定后继节点 |
+| **流控** | `modules/flow.py` | 依赖解析 + 条件激活，决定节点执行/跳过/延迟 |
+| **恢复策略** | `modules/recovery.py` | 依据失败轨迹决定修复路径（重试/跳转/中止） |
+| **资源调度** | `modules/scheduling.py` | 端边云资源申请与释放 |
+
+**钩子机制**（`hooks.py`）：
+- `ExecutionHook`：定义所有扩展点（`on_step_start`、`on_node_start`、`on_node_end`、`on_node_error`、`resolve_successors` 等），全部默认 no-op。
+- `HookManager`：把各扩展模块桥接到引擎回调，未注册模块时行为与原始引擎一致。
+
+**失败轨迹**（`failure.py`）：
+- `FailureRecord` / `FailureTrace`：记录图执行过程中各节点的失败信息，作为动态路由、恢复策略等模块的共享上下文。
+- 约定以 `__failures__` 字段（append reducer）承载于 `GraphState` 中。
+
+### 3. 面向前端的编排接口（`Orchestrator`）
 - `create_agent(...)` —— 创建 agent，返回 id
 - `add_sub_agent(parent, ...)` —— 给某个 agent 添加子 agent（可多次，添加多个）
 - `connect(a, b)` / `connect_conditional(...)` —— 连接两个 agent（含条件边）
 - `set_entry(id)` —— 指定入口
 - `to_dict()` / `from_dict()` —— 结构序列化，供前端保存/加载/渲染
 - `build_graph()` —— 一键编译为可执行图
+- `set_memory()` / `set_router()` / `set_routing_policy()` / `set_flow_controller()` / `set_recovery_strategy()` / `set_scheduler()` —— 注入可插拔模块
 
-### 3. REST 服务（FastAPI）
+### 4. REST 服务（FastAPI）
 把上述能力暴露为 HTTP 接口，前端可直接调用完成可视化编排。
 
 ---
 
-## 📦 安装
+## 安装
 
-> AgentScope 2.x 需要 **Python >= 3.10**。推荐用 conda 环境（示例中为 `long_agent`, Python 3.12）。
+> AgentScope 2.x 需要 **Python >= 3.10**。推荐用 conda 环境。
 
 ```bash
-conda activate long_agent
+# 安装全部依赖：
+pip install -r requirements.txt
 
-# 安装依赖：
-pip install -r requirements.txt          # 一次装齐
-# 或分组安装：
+# 或按分组安装：
 pip install -e ".[agentscope]"   # 接入真实 AgentScope agent（OpenAI）
 pip install -e ".[server]"       # 启动 REST 服务
 pip install -e ".[test]"         # 运行测试
+pip install -e ".[examples]"     # travel_planner 示例工具（DuckDuckGo + Playwright）
 ```
 
-### 配置 OpenAI（.env）
+安装 Playwright 后还需执行：
+```bash
+python -m playwright install chromium
+```
 
-本项目使用 **OpenAI**（不使用 DashScope），模型配置从项目根目录的 `.env` 读取：
+### 配置模型（.env）
 
 ```bash
 cp .env.example .env    # 然后编辑 .env 填入你的 key
@@ -75,7 +100,7 @@ agent = build_openai_agent("writer", "你是一名作家")  # 自动读取 .env
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
 ### A. 纯图编排
 
@@ -117,7 +142,21 @@ state = await graph.ainvoke({"input": "写一篇报告"})
 structure = orch.to_dict()                          # 导出给前端渲染
 ```
 
-### C. 接入真实 AgentScope agent
+### C. 接入可插拔模块
+
+```python
+from engine import Orchestrator
+from engine.modules.memory import MyMemoryStore       # 自行实现的 MemoryStore
+from engine.modules.routing import MyRoutingPolicy    # 自行实现的 RoutingPolicy
+
+orch = Orchestrator()
+orch.set_memory(MyMemoryStore())
+orch.set_routing_policy(MyRoutingPolicy())
+# ... 创建 agent、连接、设置入口 ...
+graph = orch.build_graph()                            # 模块自动接入钩子
+```
+
+### D. 接入真实 AgentScope agent
 
 ```python
 from engine import StateGraph, add_messages
@@ -133,7 +172,7 @@ graph.set_finish_point("critic")
 
 ---
 
-## 🌐 REST 服务
+## REST 服务
 
 ```bash
 python -m engine.server
@@ -145,6 +184,7 @@ python -m engine.server
 |------|------|------|
 | POST | `/api/agents` | 创建 agent |
 | GET | `/api/agents` | 列出 agent |
+| GET | `/api/agents/{id}` | 查看单个 agent |
 | DELETE | `/api/agents/{id}` | 删除 agent |
 | POST | `/api/agents/{id}/sub-agents` | 添加子 agent（可多次） |
 | POST | `/api/connections` | 连接两个 agent（支持条件边） |
@@ -152,37 +192,78 @@ python -m engine.server
 | POST | `/api/graph/entry` | 设置入口 |
 | GET | `/api/graph` | 导出图结构（节点+边）供可视化 |
 | POST | `/api/run` | 执行编排并返回最终状态 |
-| GET | `/api/export` / POST `/api/import` | 导出 / 导入编排 JSON |
+| GET | `/api/export` | 导出编排 JSON |
+| POST | `/api/import` | 从 JSON 导入编排 |
 
 ---
 
-## 🗂 目录结构
+## 示例
+
+### 多 Agent 混合工作流（`examples/multi_agent_workflow.py`）
+
+演示 **subagent 层级 + graph 连接**两种编排维度的混合使用：
+planner 扇出到 researcher / writer，再扇入到 reviewer（fan-out + fan-in），
+每个 agent 调用真实 OpenAI 模型。
+
+```bash
+PYTHONPATH=. python examples/multi_agent_workflow.py
+```
+
+### 旅行计划流水线（`examples/travel_planner/`）
+
+7 个 Agent 组成的线性流水线，集成 DuckDuckGo 搜索与 Playwright 网页浏览工具：
+
+```
+leader → destination → transport → accommodation → itinerary → budget_review → final_report
+```
+
+```bash
+PYTHONPATH=. python examples/travel_planner/run.py
+PYTHONPATH=. python examples/travel_planner/run.py --request "3人从北京去杭州4天，预算6000"
+```
+
+---
+
+## 目录结构
 
 ```
 engine/
-├── constants.py     # START / END 哨兵
-├── state.py         # 共享状态 + reducer
-├── node.py          # 节点抽象
-├── graph.py         # 核心图引擎（StateGraph / CompiledGraph）
-├── adapters.py      # AgentScope agent -> 图节点
-├── orchestrator.py  # 前端友好的高层编排 API
-└── server/          # FastAPI REST 服务
-examples/            # 可运行示例
-tests/               # pytest 单元测试
+├── constants.py        # START / END 哨兵
+├── state.py            # 共享状态 + reducer
+├── node.py             # 节点抽象（函数 / AgentScope agent / 子图）
+├── graph.py            # 核心图引擎（StateGraph / CompiledGraph）
+├── adapters.py         # AgentScope agent → 图节点适配器
+├── config.py           # OpenAI 模型配置（从 .env 读取）
+├── failure.py          # 失败轨迹数据结构（共享基础）
+├── hooks.py            # 执行钩子与钩子管理器（扩展点）
+├── orchestrator.py     # 面向前端可视化的高层编排 API
+├── modules/            # 可插拔扩展模块
+│   ├── memory.py       #   四级层级记忆（WORKING/TASK/PROJECT/GLOBAL）
+│   ├── routing.py      #   动态路由（静态 Router + 运行时 RoutingPolicy）
+│   ├── flow.py         #   流控（依赖解析 + 条件激活）
+│   ├── recovery.py     #   恢复策略（重试/跳转/中止）
+│   └── scheduling.py   #   端边云资源调度
+└── server/             # FastAPI REST 服务
+examples/
+├── multi_agent_workflow.py    # 多 Agent 混合工作流示例
+└── travel_planner/            # 旅行计划 7-Agent 流水线示例
+    ├── prompts.py
+    ├── tools.py               # DuckDuckGo 搜索 + Playwright 浏览 + 预算计算工具
+    └── run.py
+tests/                         # pytest 单元测试
 ```
 
 ---
 
-## 🧪 测试与示例
+## 测试
 
 ```bash
-PYTHONPATH=. python examples/multi_agent_workflow.py  # 多 Agent 混合工作流（真实 OpenAI 调用）
-PYTHONPATH=. python -m pytest tests/ -q              # 单元测试
+PYTHONPATH=. python -m pytest tests/ -q
 ```
 
 ---
 
-## 🧩 与 LangGraph 的概念对照
+## 与 LangGraph 的概念对照
 
 | LangGraph | 本项目 |
 |-----------|--------|
